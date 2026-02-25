@@ -11,7 +11,7 @@ const SCRIPT_WHITELIST_DOMAINS = [
 ];
 
 // 需要屏蔽的资源类型（加速加载、减少内存）
-const BLOCKED_RESOURCE_TYPES = ["image", "font", "stylesheet", "media"];
+const BLOCKED_RESOURCE_TYPES = ["image", "font", "media"];
 
 // 会话空闲超时时间（毫秒）
 const SESSION_IDLE_TIMEOUT = 10 * 60 * 1000;
@@ -30,6 +30,42 @@ class BrowserService {
   private browser: Browser | null = null;
   private sessions: Map<string, BrowserSession> = new Map();
   private launching: Promise<Browser> | null = null;
+
+  private clearAllSessionTimers() {
+    for (const session of this.sessions.values()) {
+      if (session.idleTimer) {
+        clearTimeout(session.idleTimer);
+      }
+    }
+  }
+
+  private isRecoverableBrowserError(err: unknown): boolean {
+    const message = (err as Error)?.message || String(err);
+    return [
+      "Target page, context or browser has been closed",
+      "Target closed",
+      "Browser has been closed",
+      "Connection closed",
+    ].some((keyword) => message.includes(keyword));
+  }
+
+  private async resetBrowser(reason: string) {
+    logger.warn(`BrowserService: ${reason}，准备重置浏览器实例`);
+
+    this.clearAllSessionTimers();
+    this.sessions.clear();
+
+    if (this.browser) {
+      try {
+        await this.browser.close();
+      } catch {
+        // 忽略关闭错误
+      }
+      this.browser = null;
+    }
+
+    this.launching = null;
+  }
 
   /**
    * 懒启动浏览器实例
@@ -55,14 +91,13 @@ class BrowserService {
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--no-first-run",
-            "--no-zygote",
-            "--single-process",
           ],
         });
 
         this.browser.on("disconnected", () => {
           logger.warn("BrowserService: 浏览器已断开连接");
           this.browser = null;
+          this.clearAllSessionTimers();
           this.sessions.clear();
         });
 
@@ -97,87 +132,111 @@ class BrowserService {
   /**
    * 创建新的浏览器会话
    */
-  private async createSession(token: string): Promise<BrowserSession> {
+  private async createSession(
+    token: string,
+    allowRetry: boolean = true
+  ): Promise<BrowserSession> {
     const browser = await this.ensureBrowser();
+    let context: BrowserContext | null = null;
 
     logger.info(`BrowserService: 为 token ${token.substring(0, 8)}... 创建新会话`);
 
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-      viewport: { width: 1920, height: 1080 },
-      locale: "zh-CN",
-    });
+    try {
+      context = await browser.newContext({
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        viewport: { width: 1920, height: 1080 },
+        locale: "zh-CN",
+      });
 
-    // 注入 cookies
-    const cookies = getCookiesForBrowser(token);
-    await context.addCookies(cookies);
+      // 注入 cookies
+      const cookies = getCookiesForBrowser(token);
+      await context.addCookies(cookies);
 
-    // 配置资源拦截
-    await context.route("**/*", (route) => {
-      const request = route.request();
-      const resourceType = request.resourceType();
-      const url = request.url();
+      // 配置资源拦截
+      await context.route("**/*", (route) => {
+        const request = route.request();
+        const resourceType = request.resourceType();
+        const url = request.url();
 
-      // 屏蔽不需要的资源类型
-      if (BLOCKED_RESOURCE_TYPES.includes(resourceType)) {
-        return route.abort();
+        // 屏蔽不需要的资源类型
+        if (BLOCKED_RESOURCE_TYPES.includes(resourceType)) {
+          return route.abort();
+        }
+
+        // 对于脚本资源，只允许白名单域名
+        if (resourceType === "script") {
+          const isWhitelisted = SCRIPT_WHITELIST_DOMAINS.some((domain) =>
+            url.includes(domain)
+          );
+          if (!isWhitelisted) {
+            return route.abort();
+          }
+        }
+
+        return route.continue();
+      });
+
+      const page = await context.newPage();
+
+      // 导航到即梦页面，让 bdms SDK 加载
+      logger.info("BrowserService: 正在导航到 jimeng.jianying.com ...");
+      await page.goto("https://jimeng.jianying.com", {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
+
+      // 等待 bdms SDK 就绪
+      logger.info("BrowserService: 等待 bdms SDK 就绪...");
+      try {
+        await page.waitForFunction(
+          () => {
+            // bdms SDK 会替换 window.fetch，检测其是否被替换
+            // 也可以检测 window.bdms 或 window.byted_acrawler
+            return (
+              (window as any).bdms?.init ||
+              (window as any).byted_acrawler ||
+              // 检测 fetch 是否被替换（bdms 会替换原生 fetch）
+              window.fetch.toString().indexOf("native code") === -1
+            );
+          },
+          { timeout: BDMS_READY_TIMEOUT }
+        );
+        logger.info("BrowserService: bdms SDK 已就绪");
+      } catch {
+        logger.warn(
+          "BrowserService: bdms SDK 等待超时，可能未完全加载，继续尝试..."
+        );
       }
 
-      // 对于脚本资源，只允许白名单域名
-      if (resourceType === "script") {
-        const isWhitelisted = SCRIPT_WHITELIST_DOMAINS.some((domain) =>
-          url.includes(domain)
-        );
-        if (!isWhitelisted) {
-          return route.abort();
+      const session: BrowserSession = {
+        context,
+        page,
+        lastUsed: Date.now(),
+        idleTimer: setTimeout(() => this.closeSession(token), SESSION_IDLE_TIMEOUT),
+      };
+
+      this.sessions.set(token, session);
+      return session;
+    } catch (err) {
+      if (context) {
+        try {
+          await context.close();
+        } catch {
+          // 忽略关闭错误
         }
       }
 
-      return route.continue();
-    });
+      if (allowRetry && this.isRecoverableBrowserError(err)) {
+        const message = (err as Error)?.message || String(err);
+        logger.warn(`BrowserService: 会话创建失败（可恢复）: ${message}`);
+        await this.resetBrowser("检测到浏览器会话异常");
+        logger.info("BrowserService: 正在重试创建会话...");
+        return this.createSession(token, false);
+      }
 
-    const page = await context.newPage();
-
-    // 导航到即梦页面，让 bdms SDK 加载
-    logger.info("BrowserService: 正在导航到 jimeng.jianying.com ...");
-    await page.goto("https://jimeng.jianying.com", {
-      waitUntil: "domcontentloaded",
-      timeout: 30000,
-    });
-
-    // 等待 bdms SDK 就绪
-    logger.info("BrowserService: 等待 bdms SDK 就绪...");
-    try {
-      await page.waitForFunction(
-        () => {
-          // bdms SDK 会替换 window.fetch，检测其是否被替换
-          // 也可以检测 window.bdms 或 window.byted_acrawler
-          return (
-            (window as any).bdms?.init ||
-            (window as any).byted_acrawler ||
-            // 检测 fetch 是否被替换（bdms 会替换原生 fetch）
-            window.fetch.toString().indexOf("native code") === -1
-          );
-        },
-        { timeout: BDMS_READY_TIMEOUT }
-      );
-      logger.info("BrowserService: bdms SDK 已就绪");
-    } catch (err) {
-      logger.warn(
-        "BrowserService: bdms SDK 等待超时，可能未完全加载，继续尝试..."
-      );
+      throw err;
     }
-
-    const session: BrowserSession = {
-      context,
-      page,
-      lastUsed: Date.now(),
-      idleTimer: setTimeout(() => this.closeSession(token), SESSION_IDLE_TIMEOUT),
-    };
-
-    this.sessions.set(token, session);
-    return session;
   }
 
   /**
@@ -279,6 +338,8 @@ class BrowserService {
       }
       this.browser = null;
     }
+
+    this.launching = null;
 
     logger.info("BrowserService: 已关闭");
   }

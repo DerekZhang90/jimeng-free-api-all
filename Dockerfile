@@ -39,6 +39,6 @@ WORKDIR /app
 # 安装 Playwright Chromium 浏览器
 RUN npx playwright-core install chromium
 
-EXPOSE 8000
+EXPOSE 5101
 
 CMD ["npm", "start"]

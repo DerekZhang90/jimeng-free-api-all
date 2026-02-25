@@ -985,7 +985,7 @@ export async function generateVideo(
   // 轮询获取结果
   let status = 20, failCode, item_list = [];
   let retryCount = 0;
-  const maxRetries = 60; // 增加重试次数，支持约20分钟的总重试时间
+  const maxRetries = 360; // 提升到约 1 小时的总轮询时间
   
   // 首次查询前等待更长时间，让服务器有时间处理请求
   await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -1442,7 +1442,7 @@ export async function generateSeedanceVideo(
   // 轮询获取结果（与普通视频相同的逻辑）
   let status = 20, failCode, item_list = [];
   let retryCount = 0;
-  const maxRetries = 60;
+  const maxRetries = 360; // 提升到约 1 小时的总轮询时间
 
   await new Promise((resolve) => setTimeout(resolve, 5000));
 

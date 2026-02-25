@@ -2,9 +2,17 @@ import fs from "fs";
 import _ from "lodash";
 
 import Request from "@/lib/request/Request.ts";
-import { generateImages, generateImageComposition } from "@/api/controllers/images.ts";
+import {
+  generateImages,
+  generateImageComposition,
+  DEFAULT_MODEL as DEFAULT_IMAGE_MODEL,
+} from "@/api/controllers/images.ts";
 import { tokenSplit } from "@/api/controllers/core.ts";
 import util from "@/lib/util.ts";
+import taskStore from "@/lib/task-store.ts";
+import taskQueue from "@/lib/task-queue.ts";
+import { sendWebhook } from "@/lib/webhook.ts";
+import logger from "@/lib/logger.ts";
 
 export default {
   prefix: "/v1/images",
@@ -29,6 +37,8 @@ export default {
         .validate("body.intelligent_ratio", v => _.isUndefined(v) || _.isBoolean(v))
         .validate("body.sample_strength", v => _.isUndefined(v) || _.isFinite(v))
         .validate("body.response_format", v => _.isUndefined(v) || _.isString(v))
+        .validate("body.async", v => _.isUndefined(v) || _.isBoolean(v))
+        .validate("body.callback_url", v => _.isUndefined(v) || (_.isString(v) && v.startsWith("http")))
         .validate("headers.authorization", _.isString);
 
       // refresh_token切分
@@ -45,25 +55,89 @@ export default {
         sample_strength: sampleStrength,
         response_format,
       } = request.body;
+      const finalModel = _.defaultTo(model, DEFAULT_IMAGE_MODEL);
 
       const responseFormat = _.defaultTo(response_format, "url");
-      const imageUrls = await generateImages(model, prompt, {
-        ratio,
-        resolution,
-        sampleStrength,
-        negativePrompt,
-        intelligentRatio,
-      }, token);
+
+      // ====== 异步模式 ======
+      if (request.body.async === true) {
+        const task = await taskStore.create({
+          type: "image",
+          status: "pending",
+          callback_url: request.body.callback_url,
+          model: finalModel,
+          prompt,
+        });
+
+        taskQueue.enqueue(task.id, async () => {
+          try {
+            await taskStore.update(task.id, { status: "processing", progress: "生成中" });
+            const imageUrls = await generateImages(
+              finalModel,
+              prompt,
+              {
+                ratio,
+                resolution,
+                sampleStrength,
+                negativePrompt,
+                intelligentRatio,
+              },
+              token
+            );
+
+            let data = [];
+            if (responseFormat === "b64_json") {
+              data = (await Promise.all(imageUrls.map((url) => util.fetchFileBASE64(url)))).map((b64) => ({
+                b64_json: b64,
+              }));
+            } else {
+              data = imageUrls.map((url) => ({ url }));
+            }
+
+            await taskStore.update(task.id, {
+              status: "completed",
+              result: { created: util.unixTimestamp(), data },
+              completed_at: Math.floor(Date.now() / 1000),
+            });
+          } catch (err: any) {
+            logger.error(`[Async] 图片生成任务 ${task.id} 失败: ${err.message}`);
+            await taskStore.update(task.id, {
+              status: "failed",
+              error: err.message,
+              completed_at: Math.floor(Date.now() / 1000),
+            });
+          }
+
+          const finalTask = await taskStore.get(task.id);
+          if (finalTask?.callback_url) {
+            await sendWebhook(finalTask.callback_url, finalTask);
+          }
+        });
+
+        return { task_id: task.id, status: "pending" };
+      }
+
+      // ====== 同步模式（原有逻辑） ======
+      const imageUrls = await generateImages(
+        finalModel,
+        prompt,
+        {
+          ratio,
+          resolution,
+          sampleStrength,
+          negativePrompt,
+          intelligentRatio,
+        },
+        token
+      );
 
       let data = [];
-      if (responseFormat == "b64_json") {
-        data = (
-          await Promise.all(imageUrls.map((url) => util.fetchFileBASE64(url)))
-        ).map((b64) => ({ b64_json: b64 }));
-      } else {
-        data = imageUrls.map((url) => ({
-          url,
+      if (responseFormat === "b64_json") {
+        data = (await Promise.all(imageUrls.map((url) => util.fetchFileBASE64(url)))).map((b64) => ({
+          b64_json: b64,
         }));
+      } else {
+        data = imageUrls.map((url) => ({ url }));
       }
       return {
         created: util.unixTimestamp(),
@@ -95,6 +169,8 @@ export default {
           .validate("body.intelligent_ratio", v => _.isUndefined(v) || (typeof v === 'string' && (v === 'true' || v === 'false')) || _.isBoolean(v))
           .validate("body.sample_strength", v => _.isUndefined(v) || (typeof v === 'string' && !isNaN(parseFloat(v))) || _.isFinite(v))
           .validate("body.response_format", v => _.isUndefined(v) || _.isString(v))
+          .validate("body.async", v => _.isUndefined(v) || _.isBoolean(v) || v === "true" || v === "false")
+          .validate("body.callback_url", v => _.isUndefined(v) || (_.isString(v) && v.startsWith("http")))
           .validate("headers.authorization", _.isString);
       } else {
         request
@@ -107,23 +183,32 @@ export default {
           .validate("body.intelligent_ratio", v => _.isUndefined(v) || _.isBoolean(v))
           .validate("body.sample_strength", v => _.isUndefined(v) || _.isFinite(v))
           .validate("body.response_format", v => _.isUndefined(v) || _.isString(v))
+          .validate("body.async", v => _.isUndefined(v) || _.isBoolean(v))
+          .validate("body.callback_url", v => _.isUndefined(v) || (_.isString(v) && v.startsWith("http")))
           .validate("headers.authorization", _.isString);
       }
 
       let images: (string | Buffer)[] = [];
       if (isMultiPart) {
-        const files = request.files?.images;
-        if (!files) {
-          throw new Error("在form-data中缺少 'images' 字段");
-        }
-        const imageFiles = Array.isArray(files) ? files : [files];
+        const rawFiles: any = request.files;
+        const imageFiles = Array.isArray(rawFiles)
+          ? rawFiles
+          : rawFiles?.images
+            ? (Array.isArray(rawFiles.images) ? rawFiles.images : [rawFiles.images])
+            : [];
+
         if (imageFiles.length === 0) {
           throw new Error("至少需要提供1张输入图片");
         }
         if (imageFiles.length > 10) {
           throw new Error("最多支持10张输入图片");
         }
-        images = imageFiles.map(file => fs.readFileSync(file.filepath));
+        images = imageFiles.map((file: any, index: number) => {
+          if (!file?.filepath) {
+            throw new Error(`第 ${index + 1} 个上传文件无效`);
+          }
+          return fs.readFileSync(file.filepath);
+        });
       } else {
         const bodyImages = request.body.images;
         if (!bodyImages || bodyImages.length === 0) {
@@ -158,6 +243,7 @@ export default {
         sample_strength: sampleStrength,
         response_format,
       } = request.body;
+      const finalModel = _.defaultTo(model, DEFAULT_IMAGE_MODEL);
 
       // 如果是 multipart/form-data，需要将字符串转换为数字和布尔值
       const finalSampleStrength = isMultiPart && typeof sampleStrength === 'string'
@@ -169,23 +255,97 @@ export default {
         : intelligentRatio;
 
       const responseFormat = _.defaultTo(response_format, "url");
-      const resultUrls = await generateImageComposition(model, prompt, images, {
-        ratio,
-        resolution,
-        sampleStrength: finalSampleStrength,
-        negativePrompt,
-        intelligentRatio: finalIntelligentRatio,
-      }, token);
+
+      const isAsync = isMultiPart && typeof request.body.async === "string"
+        ? request.body.async === "true"
+        : request.body.async === true;
+
+      // ====== 异步模式 ======
+      if (isAsync) {
+        const task = await taskStore.create({
+          type: "composition",
+          status: "pending",
+          callback_url: request.body.callback_url,
+          model: finalModel,
+          prompt,
+        });
+
+        taskQueue.enqueue(task.id, async () => {
+          try {
+            await taskStore.update(task.id, { status: "processing", progress: "生成中" });
+            const resultUrls = await generateImageComposition(
+              finalModel,
+              prompt,
+              images,
+              {
+                ratio,
+                resolution,
+                sampleStrength: finalSampleStrength,
+                negativePrompt,
+                intelligentRatio: finalIntelligentRatio,
+              },
+              token
+            );
+
+            let data = [];
+            if (responseFormat === "b64_json") {
+              data = (await Promise.all(resultUrls.map((url) => util.fetchFileBASE64(url)))).map((b64) => ({
+                b64_json: b64,
+              }));
+            } else {
+              data = resultUrls.map((url) => ({ url }));
+            }
+
+            await taskStore.update(task.id, {
+              status: "completed",
+              result: {
+                created: util.unixTimestamp(),
+                data,
+                input_images: images.length,
+                composition_type: "multi_image_synthesis",
+              },
+              completed_at: Math.floor(Date.now() / 1000),
+            });
+          } catch (err: any) {
+            logger.error(`[Async] 图生图任务 ${task.id} 失败: ${err.message}`);
+            await taskStore.update(task.id, {
+              status: "failed",
+              error: err.message,
+              completed_at: Math.floor(Date.now() / 1000),
+            });
+          }
+
+          const finalTask = await taskStore.get(task.id);
+          if (finalTask?.callback_url) {
+            await sendWebhook(finalTask.callback_url, finalTask);
+          }
+        });
+
+        return { task_id: task.id, status: "pending" };
+      }
+
+      // ====== 同步模式（原有逻辑） ======
+      const resultUrls = await generateImageComposition(
+        finalModel,
+        prompt,
+        images,
+        {
+          ratio,
+          resolution,
+          sampleStrength: finalSampleStrength,
+          negativePrompt,
+          intelligentRatio: finalIntelligentRatio,
+        },
+        token
+      );
 
       let data = [];
-      if (responseFormat == "b64_json") {
-        data = (
-          await Promise.all(resultUrls.map((url) => util.fetchFileBASE64(url)))
-        ).map((b64) => ({ b64_json: b64 }));
-      } else {
-        data = resultUrls.map((url) => ({
-          url,
+      if (responseFormat === "b64_json") {
+        data = (await Promise.all(resultUrls.map((url) => util.fetchFileBASE64(url)))).map((b64) => ({
+          b64_json: b64,
         }));
+      } else {
+        data = resultUrls.map((url) => ({ url }));
       }
 
       return {

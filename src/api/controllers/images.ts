@@ -12,6 +12,15 @@ const DEFAULT_ASSISTANT_ID = 513695;
 export const DEFAULT_MODEL = "jimeng-4.5";
 const DRAFT_VERSION = "3.3.4";
 const DRAFT_MIN_VERSION = "3.0.2";
+const IMAGE_POLL_INTERVAL_MS = 5000;
+const IMAGE_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+const IMAGE_MAX_POLL_COUNT = Math.ceil(IMAGE_POLL_TIMEOUT_MS / IMAGE_POLL_INTERVAL_MS);
+const IMAGE_POLL_PROGRESS_LOG_EVERY = Math.max(1, Math.floor(30000 / IMAGE_POLL_INTERVAL_MS));
+const IMAGE_POLL_DETAIL_LOG_EVERY = Math.max(1, Math.floor(60000 / IMAGE_POLL_INTERVAL_MS));
+
+function isContentFilteredFailCode(failCode: unknown): boolean {
+  return Number(failCode) === 2038;
+}
 
 // 支持的图片比例和分辨率配置
 const RESOLUTION_OPTIONS: {
@@ -756,13 +765,13 @@ export async function generateImageComposition(
     
   let status = 20, failCode, item_list = [];
   let pollCount = 0;
-  const maxPollCount = 600; // 最多轮询10分钟
+  const maxPollCount = IMAGE_MAX_POLL_COUNT; // 最多轮询10分钟
 
   while (pollCount < maxPollCount) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await new Promise((resolve) => setTimeout(resolve, IMAGE_POLL_INTERVAL_MS));
     pollCount++;
     
-    if (pollCount % 30 === 0) {
+    if (pollCount % IMAGE_POLL_PROGRESS_LOG_EVERY === 0) {
       logger.info(`图生图进度: 第 ${pollCount} 次轮询 (history_id: ${historyId})，当前状态: ${status}，已生成: ${item_list.length} 张图片...`);
     }
 
@@ -852,6 +861,12 @@ export async function generateImageComposition(
     failCode = result[historyId].fail_code;
     item_list = result[historyId].item_list || [];
 
+    if (status === 30) {
+      if (isContentFilteredFailCode(failCode))
+        throw new APIException(EX.API_CONTENT_FILTERED);
+      throw new APIException(EX.API_IMAGE_GENERATION_FAILED, `图生图失败，错误代码: ${failCode}`);
+    }
+
     // 检查是否已生成图片
     if (item_list.length > 0) {
       logger.info(`图生图完成: 状态=${status}, 已生成 ${item_list.length} 张图片`);
@@ -859,25 +874,18 @@ export async function generateImageComposition(
     }
     
     // 记录详细状态
-    if (pollCount % 60 === 0) {
+    if (pollCount % IMAGE_POLL_DETAIL_LOG_EVERY === 0) {
       logger.info(`图生图详细状态: status=${status}, item_list.length=${item_list.length}, failCode=${failCode || 'none'}`);
     }
     
     // 如果状态是完成但图片数量为0，记录并继续等待
-    if (status === 10 && item_list.length === 0 && pollCount % 30 === 0) {
+    if (status === 10 && item_list.length === 0 && pollCount % IMAGE_POLL_PROGRESS_LOG_EVERY === 0) {
       logger.info(`图生图状态已完成但无图片生成: 状态=${status}, 继续等待...`);
     }
   }
 
   if (pollCount >= maxPollCount) {
     logger.warn(`图生图超时: 轮询了 ${pollCount} 次，当前状态: ${status}，已生成图片数: ${item_list.length}`);
-  }
-
-  if (status === 30) {
-    if (failCode === '2038')
-      throw new APIException(EX.API_CONTENT_FILTERED);
-    else
-      throw new APIException(EX.API_IMAGE_GENERATION_FAILED, `图生图失败，错误代码: ${failCode}`);
   }
 
   const resultImageUrls = item_list.map((item) => {
@@ -1034,13 +1042,13 @@ async function generateMultiImages(
   // 直接使用 history_id 轮询生成结果（增加轮询时间）
   let status = 20, failCode, item_list = [];
   let pollCount = 0;
-  const maxPollCount = 600; // 最多轮询10分钟（600次 * 1秒）
+  const maxPollCount = IMAGE_MAX_POLL_COUNT; // 最多轮询10分钟
 
   while (pollCount < maxPollCount) {
-    await new Promise((resolve) => setTimeout(resolve, 1000)); // 每1秒轮询一次
+    await new Promise((resolve) => setTimeout(resolve, IMAGE_POLL_INTERVAL_MS));
     pollCount++;
     
-    if (pollCount % 30 === 0) {
+    if (pollCount % IMAGE_POLL_PROGRESS_LOG_EVERY === 0) {
       logger.info(`多图生成进度: 第 ${pollCount} 次轮询 (history_id: ${historyId})，当前状态: ${status}，已生成: ${item_list.length}/${targetImageCount} 张图片...`);
     }
 
@@ -1130,6 +1138,12 @@ async function generateMultiImages(
     failCode = result[historyId].fail_code;
     item_list = result[historyId].item_list || [];
 
+    if (status === 30) {
+      if (isContentFilteredFailCode(failCode))
+        throw new APIException(EX.API_CONTENT_FILTERED);
+      throw new APIException(EX.API_IMAGE_GENERATION_FAILED, `生成失败，错误代码: ${failCode}`);
+    }
+
     // 检查是否已生成足够的图片
     if (item_list.length >= targetImageCount) {
       logger.info(`多图生成完成: 状态=${status}, 已生成 ${item_list.length} 张图片`);
@@ -1137,25 +1151,18 @@ async function generateMultiImages(
     }
     
     // 记录详细状态
-    if (pollCount % 60 === 0) {
+    if (pollCount % IMAGE_POLL_DETAIL_LOG_EVERY === 0) {
       logger.info(`jimeng-4.0 详细状态: status=${status}, item_list.length=${item_list.length}, failCode=${failCode || 'none'}`);
     }
     
     // 如果状态是完成但图片数量不够，记录并继续等待
-    if (status === 10 && item_list.length < targetImageCount && pollCount % 30 === 0) {
+    if (status === 10 && item_list.length < targetImageCount && pollCount % IMAGE_POLL_PROGRESS_LOG_EVERY === 0) {
       logger.info(`jimeng-4.0 状态已完成但图片数量不足: 状态=${status}, 已生成 ${item_list.length}/${targetImageCount} 张图片，继续等待...`);
     }
   }
 
   if (pollCount >= maxPollCount) {
     logger.warn(`多图生成超时: 轮询了 ${pollCount} 次，当前状态: ${status}，已生成图片数: ${item_list.length}`);
-  }
-
-  if (status === 30) {
-    if (failCode === '2038')
-      throw new APIException(EX.API_CONTENT_FILTERED);
-    else
-      throw new APIException(EX.API_IMAGE_GENERATION_FAILED, `生成失败，错误代码: ${failCode}`);
   }
 
   const imageUrls = item_list.map((item) => {
@@ -1320,13 +1327,13 @@ export async function generateImages(
 
   let status = 20, failCode, item_list = [];
   let pollCount = 0;
-  const maxPollCount = 600; // 最多轮询10分钟
+  const maxPollCount = IMAGE_MAX_POLL_COUNT; // 最多轮询10分钟
 
   while (pollCount < maxPollCount) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await new Promise((resolve) => setTimeout(resolve, IMAGE_POLL_INTERVAL_MS));
     pollCount++;
 
-    if (pollCount % 30 === 0) {
+    if (pollCount % IMAGE_POLL_PROGRESS_LOG_EVERY === 0) {
       logger.info(`文生图进度: 第 ${pollCount} 次轮询 (history_id: ${historyId})，当前状态: ${status}，已生成: ${item_list.length} 张图片...`);
     }
 
@@ -1436,6 +1443,12 @@ export async function generateImages(
     failCode = result[historyId].fail_code;
     item_list = result[historyId].item_list || [];
 
+    if (status === 30) {
+      if (isContentFilteredFailCode(failCode))
+        throw new APIException(EX.API_CONTENT_FILTERED);
+      throw new APIException(EX.API_IMAGE_GENERATION_FAILED);
+    }
+
     // 检查是否已生成图片
     if (item_list.length > 0) {
       logger.info(`文生图完成: 状态=${status}, 已生成 ${item_list.length} 张图片`);
@@ -1443,25 +1456,18 @@ export async function generateImages(
     }
 
     // 记录详细状态
-    if (pollCount % 60 === 0) {
+    if (pollCount % IMAGE_POLL_DETAIL_LOG_EVERY === 0) {
       logger.info(`文生图详细状态: status=${status}, item_list.length=${item_list.length}, failCode=${failCode || 'none'}`);
     }
 
     // 如果状态是完成但图片数量为0，记录并继续等待
-    if (status === 10 && item_list.length === 0 && pollCount % 30 === 0) {
+    if (status === 10 && item_list.length === 0 && pollCount % IMAGE_POLL_PROGRESS_LOG_EVERY === 0) {
       logger.info(`文生图状态已完成但无图片生成: 状态=${status}, 继续等待...`);
     }
   }
 
   if (pollCount >= maxPollCount) {
     logger.warn(`文生图超时: 轮询了 ${pollCount} 次，当前状态: ${status}，已生成图片数: ${item_list.length}`);
-  }
-
-  if (status === 30) {
-    if (failCode === '2038')
-      throw new APIException(EX.API_CONTENT_FILTERED);
-    else
-      throw new APIException(EX.API_IMAGE_GENERATION_FAILED);
   }
 
   const imageUrls = item_list.map((item) => {
