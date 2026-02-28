@@ -12,6 +12,31 @@ import browserService from "@/lib/browser-service.ts";
 const DEFAULT_ASSISTANT_ID = 513695;
 export const DEFAULT_MODEL = "jimeng-video-3.0";
 const DEFAULT_DRAFT_VERSION = "3.2.8";
+const DEFAULT_VIDEO_POLL_INTERVAL_MS = 60 * 1000; // 1 分钟
+const DEFAULT_VIDEO_POLL_TIMEOUT_MS = 6 * 60 * 60 * 1000; // 6 小时
+const DEFAULT_VIDEO_POLL_INITIAL_DELAY_MS = 5000;
+
+function parsePositiveIntEnv(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+const VIDEO_POLL_INTERVAL_MS = parsePositiveIntEnv(
+  process.env.VIDEO_POLL_INTERVAL_MS,
+  DEFAULT_VIDEO_POLL_INTERVAL_MS
+);
+export const VIDEO_POLL_TIMEOUT_MS = parsePositiveIntEnv(
+  process.env.VIDEO_POLL_TIMEOUT_MS,
+  DEFAULT_VIDEO_POLL_TIMEOUT_MS
+);
+const VIDEO_POLL_INITIAL_DELAY_MS = parsePositiveIntEnv(
+  process.env.VIDEO_POLL_INITIAL_DELAY_MS,
+  DEFAULT_VIDEO_POLL_INITIAL_DELAY_MS
+);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 const MODEL_DRAFT_VERSIONS: { [key: string]: string } = {
   "jimeng-video-3.5-pro": "3.3.4",
@@ -984,17 +1009,21 @@ export async function generateVideo(
 
   // 轮询获取结果
   let status = 20, failCode, item_list = [];
-  let retryCount = 0;
-  const maxRetries = 360; // 提升到约 1 小时的总轮询时间
-  
-  // 首次查询前等待更长时间，让服务器有时间处理请求
-  await new Promise((resolve) => setTimeout(resolve, 5000));
-  
-  logger.info(`开始轮询视频生成结果，历史ID: ${historyId}，最大重试次数: ${maxRetries}`);
+  let pollCount = 0;
+  const pollStartAt = Date.now();
+  const pollDeadline = pollStartAt + VIDEO_POLL_TIMEOUT_MS;
+
+  // 首次查询前等待一小段时间，让服务器开始处理请求
+  await sleep(VIDEO_POLL_INITIAL_DELAY_MS);
+
+  logger.info(
+    `开始轮询视频生成结果，历史ID: ${historyId}，轮询间隔: ${Math.floor(VIDEO_POLL_INTERVAL_MS / 1000)} 秒，超时: ${Math.floor(VIDEO_POLL_TIMEOUT_MS / 1000 / 60)} 分钟`
+  );
   logger.info(`即梦官网API地址: https://jimeng.jianying.com/mweb/v1/get_history_by_ids`);
   logger.info(`视频生成请求已发送，请同时在即梦官网查看: https://jimeng.jianying.com/ai-tool/video/generate`);
   
-  while (status === 20 && retryCount < maxRetries) {
+  while (status === 20 && Date.now() < pollDeadline) {
+    pollCount++;
     try {
       // 构建请求URL和参数
       const requestUrl = "/mweb/v1/get_history_by_ids";
@@ -1004,11 +1033,11 @@ export async function generateVideo(
       
       // 尝试两种不同的API请求方式
       let result;
-      let useAlternativeApi = retryCount > 10 && retryCount % 2 === 0; // 在重试10次后，每隔一次尝试备用API
+      let useAlternativeApi = pollCount > 10 && pollCount % 2 === 0; // 在轮询10次后，每隔一次尝试备用API
       
       if (useAlternativeApi) {
         // 备用API请求方式
-        logger.info(`尝试备用API请求方式，URL: ${requestUrl}, 历史ID: ${historyId}, 重试次数: ${retryCount + 1}/${maxRetries}`);
+        logger.info(`尝试备用API请求方式，URL: ${requestUrl}, 历史ID: ${historyId}, 轮询次数: ${pollCount}`);
         const alternativeRequestData = {
           history_record_ids: [historyId],
         };
@@ -1018,7 +1047,7 @@ export async function generateVideo(
         logger.info(`备用API响应摘要: ${JSON.stringify(result).substring(0, 500)}...`);
       } else {
         // 标准API请求方式
-        logger.info(`发送请求获取视频生成结果，URL: ${requestUrl}, 历史ID: ${historyId}, 重试次数: ${retryCount + 1}/${maxRetries}`);
+        logger.info(`发送请求获取视频生成结果，URL: ${requestUrl}, 历史ID: ${historyId}, 轮询次数: ${pollCount}`);
         result = await request("post", requestUrl, refreshToken, {
           data: requestData,
         });
@@ -1044,14 +1073,14 @@ export async function generateVideo(
         logger.info(`从historyId键获取到历史记录`);
       } else {
         // 所有API都没有返回有效数据
-        logger.warn(`历史记录不存在，重试中 (${retryCount + 1}/${maxRetries})... 历史ID: ${historyId}`);
+        logger.warn(`历史记录不存在，第 ${pollCount} 次轮询未命中，历史ID: ${historyId}`);
         logger.info(`请同时在即梦官网检查视频是否已生成: https://jimeng.jianying.com/ai-tool/video/generate`);
 
-        retryCount++;
-        // 增加重试间隔时间，但设置上限为30秒
-        const waitTime = Math.min(2000 * (retryCount + 1), 30000);
-        logger.info(`等待 ${waitTime}ms 后进行第 ${retryCount + 1} 次重试`);
-        await new Promise((resolve) => setTimeout(resolve, waitTime));
+        const waitTime = Math.min(VIDEO_POLL_INTERVAL_MS, Math.max(0, pollDeadline - Date.now()));
+        if (waitTime > 0) {
+          logger.info(`等待 ${Math.floor(waitTime / 1000)} 秒后进行下一次轮询`);
+          await sleep(waitTime);
+        }
         continue;
       }
       
@@ -1090,20 +1119,26 @@ export async function generateVideo(
       
       // 如果状态仍在处理中，等待后继续
       if (status === 20) {
-        const waitTime = 2000 * (Math.min(retryCount + 1, 5)); // 随着重试次数增加等待时间，但最多10秒
-        logger.info(`视频生成中，状态码: ${status}，等待 ${waitTime}ms 后继续查询`);
-        await new Promise((resolve) => setTimeout(resolve, waitTime));
+        const waitTime = Math.min(VIDEO_POLL_INTERVAL_MS, Math.max(0, pollDeadline - Date.now()));
+        if (waitTime > 0) {
+          logger.info(`视频生成中，状态码: ${status}，等待 ${Math.floor(waitTime / 1000)} 秒后继续查询`);
+          await sleep(waitTime);
+        }
       }
-    } catch (error) {
+    } catch (error: any) {
+      if (error instanceof APIException) throw error;
       logger.error(`轮询视频生成结果出错: ${error.message}`);
-      retryCount++;
-      await new Promise((resolve) => setTimeout(resolve, 2000 * (retryCount + 1)));
+      const waitTime = Math.min(VIDEO_POLL_INTERVAL_MS, Math.max(0, pollDeadline - Date.now()));
+      if (waitTime > 0) {
+        await sleep(waitTime);
+      }
     }
   }
   
   // 如果达到最大重试次数仍未成功
-  if (retryCount >= maxRetries && status === 20) {
-    logger.error(`视频生成超时，已尝试 ${retryCount} 次，总耗时约 ${Math.floor(retryCount * 2000 / 1000 / 60)} 分钟`);
+  if (status === 20 && Date.now() >= pollDeadline) {
+    const elapsedMs = Date.now() - pollStartAt;
+    logger.error(`视频生成超时，已轮询 ${pollCount} 次，总耗时约 ${Math.floor(elapsedMs / 1000 / 60)} 分钟`);
     const error = new APIException(EX.API_IMAGE_GENERATION_FAILED, "获取视频生成结果超时，请稍后在即梦官网查看您的视频");
     // 添加历史ID到错误对象，以便在chat.ts中显示
     error.historyId = historyId;
@@ -1441,14 +1476,18 @@ export async function generateSeedanceVideo(
 
   // 轮询获取结果（与普通视频相同的逻辑）
   let status = 20, failCode, item_list = [];
-  let retryCount = 0;
-  const maxRetries = 360; // 提升到约 1 小时的总轮询时间
+  let pollCount = 0;
+  const pollStartAt = Date.now();
+  const pollDeadline = pollStartAt + VIDEO_POLL_TIMEOUT_MS;
 
-  await new Promise((resolve) => setTimeout(resolve, 5000));
+  await sleep(VIDEO_POLL_INITIAL_DELAY_MS);
 
-  logger.info(`Seedance: 开始轮询视频生成结果，历史ID: ${historyId}`);
+  logger.info(
+    `Seedance: 开始轮询视频生成结果，历史ID: ${historyId}，轮询间隔: ${Math.floor(VIDEO_POLL_INTERVAL_MS / 1000)} 秒，超时: ${Math.floor(VIDEO_POLL_TIMEOUT_MS / 1000 / 60)} 分钟`
+  );
 
-  while (status === 20 && retryCount < maxRetries) {
+  while (status === 20 && Date.now() < pollDeadline) {
+    pollCount++;
     try {
       const result = await request("post", "/mweb/v1/get_history_by_ids", refreshToken, {
         data: { history_ids: [historyId] },
@@ -1462,9 +1501,10 @@ export async function generateSeedanceVideo(
       let historyData = result.history_list?.[0] || result[historyId];
 
       if (!historyData) {
-        retryCount++;
-        const waitTime = Math.min(2000 * (retryCount + 1), 30000);
-        await new Promise((resolve) => setTimeout(resolve, waitTime));
+        const waitTime = Math.min(VIDEO_POLL_INTERVAL_MS, Math.max(0, pollDeadline - Date.now()));
+        if (waitTime > 0) {
+          await sleep(waitTime);
+        }
         continue;
       }
       status = historyData.status;
@@ -1482,20 +1522,24 @@ export async function generateSeedanceVideo(
       }
 
       if (status === 20) {
-        const waitTime = 2000 * Math.min(retryCount + 1, 5);
-        await new Promise((resolve) => setTimeout(resolve, waitTime));
+        const waitTime = Math.min(VIDEO_POLL_INTERVAL_MS, Math.max(0, pollDeadline - Date.now()));
+        if (waitTime > 0) {
+          await sleep(waitTime);
+        }
       }
-
-      retryCount++;
     } catch (error) {
       if (error instanceof APIException) throw error;
       logger.error(`Seedance: 轮询出错: ${error.message}`);
-      retryCount++;
-      await new Promise((resolve) => setTimeout(resolve, 2000 * (retryCount + 1)));
+      const waitTime = Math.min(VIDEO_POLL_INTERVAL_MS, Math.max(0, pollDeadline - Date.now()));
+      if (waitTime > 0) {
+        await sleep(waitTime);
+      }
     }
   }
 
-  if (retryCount >= maxRetries && status === 20) {
+  if (status === 20 && Date.now() >= pollDeadline) {
+    const elapsedMs = Date.now() - pollStartAt;
+    logger.error(`Seedance: 视频生成超时，已轮询 ${pollCount} 次，总耗时约 ${Math.floor(elapsedMs / 1000 / 60)} 分钟`);
     const error = new APIException(EX.API_IMAGE_GENERATION_FAILED, "视频生成超时");
     error.historyId = historyId;
     throw error;
